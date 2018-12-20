@@ -1,0 +1,492 @@
+
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from sklearn.linear_model import LinearRegression\n",
+    "from sklearn.metrics import mutual_info_score\n",
+    "import scipy.stats as stats\n",
+    "import pandas as pd\n",
+    "import numpy as np\n",
+    "import networkx as nx"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "data = pd.read_csv(\"../frontal_lobe.csv\").iloc[:,2:]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def BIC(X, y, penalty=1.0):\n",
+    "    \"\"\" X is the set of variables in the model that might be parents of y, y is the variable\n",
+    "    we are checking against\"\"\"\n",
+    "    \n",
+    "    if len(X.shape) < 2:\n",
+    "        X = X.reshape(-1, 1)\n",
+    "\n",
+    "    regression = LinearRegression().fit(X, y)\n",
+    "    y_predicted = regression.predict(X)\n",
+    "    residuals = y - y_predicted\n",
+    "    n, k = X.shape\n",
+    "    mean_sq_error = np.sum(np.square(residuals))/n\n",
+    "    BIC_score = -n*np.log(mean_sq_error) - penalty*k*np.log(n)\n",
+    "\n",
+    "    return BIC_score"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The penalty parameter only offers a meaningful reduction in the search of\n",
+    "Markov Blankets if it makes the penalty be in the same order of magnitude\n",
+    "as the log likelihood term. If it's too small, all variables are important\n",
+    "If it's too big, all variables can be neglected. \n",
+    "This says something about the structure of the net (small contributions from various components)\n",
+    "\n",
+    "It should be chosen so that k*log(n)*penalty ~ n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class FGES:\n",
+    "    def __init__(self, data, penalty=1.0):\n",
+    "        self.data = data.values\n",
+    "        n = len(data.columns)\n",
+    "        self.nodes = list(range(n))\n",
+    "        self.edges = {}\n",
+    "        # Each column is, given the parents of this node, add the node in the row.\n",
+    "        self.BICS = np.zeros((n, n))\n",
+    "        self.penalty = penalty\n",
+    "        self.init_BICS()\n",
+    "        \n",
+    "    def BIC(self, X, y):\n",
+    "        return BIC(X, y, self.penalty)\n",
+    "\n",
+    "    def init_BICS(self):\n",
+    "        n = len(self.nodes)\n",
+    "        for i in range(n):\n",
+    "            y = self.data[:, i]\n",
+    "            for j in range(i+1, n):\n",
+    "                X = self.data[:, j]\n",
+    "                self.BICS[i, j] = self.BIC(X, y)\n",
+    "                self.BICS[j, i] = self.BICS[i, j]\n",
+    "        \n",
+    "    def add_edge(self):\n",
+    "        if np.amax(self.BICS) <= 0:\n",
+    "            return False\n",
+    "        \n",
+    "        i, j = np.unravel_index(np.argmax(self.BICS), self.BICS.shape)\n",
+    "\n",
+    "        def _add(A, B):\n",
+    "            try:\n",
+    "                if B in set(self.edges[A]) or B in set(self.edges[A]):\n",
+    "                    self.BICS[j, i], self.BICS[i, j] = 0, 0\n",
+    "                    return True\n",
+    "                \n",
+    "                self.edges[A].append(B)\n",
+    "            except KeyError:\n",
+    "                self.edges[A] = [B]\n",
+    "        \n",
+    "        _add(i, j)\n",
+    "        \n",
+    "        Ai = self.edges[i]\n",
+    "        data_i = self.data[:, Ai]\n",
+    "        y_i = self.data[:, i]\n",
+    "        \n",
+    "        for node in set(self.nodes) - set((i, j)):\n",
+    "            data_node = self.data[:, node].reshape(-1, 1)\n",
+    "            if node not in Ai:\n",
+    "                X = np.hstack((data_i, data_node))\n",
+    "                self.BICS[node, i] = self.BIC(X, y_i) - self.BICS[j, i]\n",
+    "                self.BICS[i, node] = self.BICS[node, i]\n",
+    "        \n",
+    "        self.BICS[j, i], self.BICS[i, j] = 0, 0\n",
+    "        return True\n",
+    "    \n",
+    "    def init_BICS_deletion(self):\n",
+    "        n = len(self.nodes)\n",
+    "        self.BICS = np.zeros((n, n))\n",
+    "        for node in self.nodes:\n",
+    "            try:\n",
+    "                Adj = self.edges[node]\n",
+    "            except KeyError:\n",
+    "                continue\n",
+    "                \n",
+    "            y = self.data[:, node]\n",
+    "            data_n = self.data[:, Adj]\n",
+    "            start_BIC = self.BIC(data_n, y)\n",
+    "            if len(Adj) == 1:\n",
+    "                continue\n",
+    "            for edge in Adj:\n",
+    "                data_n = self.data[:, tuple(set(Adj)-{edge})]\n",
+    "                self.BICS[edge, node] = self.BIC(data_n, y) - start_BIC\n",
+    "            \n",
+    "    def delete_edge(self):\n",
+    "        if np.amax(self.BICS) <= 0:\n",
+    "            return False\n",
+    "        \n",
+    "        j, i = np.unravel_index(np.argmax(self.BICS), self.BICS.shape)\n",
+    "        self.edges[i].remove(j)\n",
+    "        \n",
+    "        Adj = self.edges[i]\n",
+    "        y = self.data[:, i]\n",
+    "        data_n = self.data[:, Adj]\n",
+    "        start_BIC = self.BIC(data_n, y)\n",
+    "        \n",
+    "        for edge in Adj:\n",
+    "            X = self.data[:, tuple(set(Adj)-{edge})]\n",
+    "            self.BICS[edge, i] = self.BIC(data_n, y) - start_BIC\n",
+    "            self.BICS[i, edge] = self.BICS[edge, i]\n",
+    "        \n",
+    "        self.BICS[j, i], self.BICS[i, j] = 0, 0\n",
+    "        return True\n",
+    "        \n",
+    "        "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 21,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "test = FGES(data.iloc[:, :100], penalty=60)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 23,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "i = 0\n",
+    "while test.add_edge():\n",
+    "    continue"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [
+    {
+     "ename": "NameError",
+     "evalue": "name 'np' is not defined",
+     "output_type": "error",
+     "traceback": [
+      "\u001b[0;31m---------------------------------------------------------------------------\u001b[0m",
+      "\u001b[0;31mNameError\u001b[0m                                 Traceback (most recent call last)",
+      "\u001b[0;32m<ipython-input-1-5c5a52921b92>\u001b[0m in \u001b[0;36m<module>\u001b[0;34m()\u001b[0m\n\u001b[0;32m----> 1\u001b[0;31m \u001b[0mnp\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mset_printoptions\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mlinewidth\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0;36m240\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m      2\u001b[0m \u001b[0mtest\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0medges\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;31mNameError\u001b[0m: name 'np' is not defined"
+     ]
+    }
+   ],
+   "source": [
+    "np.set_printoptions(linewidth=240)\n",
+    "test.edges"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 146,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "5\n",
+      "10\n",
+      "15\n",
+      "20\n",
+      "25\n",
+      "30\n",
+      "35\n",
+      "40\n"
+     ]
+    }
+   ],
+   "source": [
+    "i = 0\n",
+    "test.init_BICS_deletion()\n",
+    "while test.delete_edge():\n",
+    "    i += 1\n",
+    "    if i % 5 == 0:\n",
+    "        print(i)\n",
+    "    continue"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 147,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "(0, 0)"
+      ]
+     },
+     "execution_count": 147,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "np.unravel_index(np.argmax(test.BICS), test.BICS.shape)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 148,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "{29: [61, 81],\n",
+       " 67: [69, 73, 78, 74],\n",
+       " 48: [79, 61, 58, 76],\n",
+       " 39: [69, 73, 57, 97],\n",
+       " 21: [66, 81, 60, 53],\n",
+       " 12: [14, 52],\n",
+       " 37: [79],\n",
+       " 32: [79, 68, 60, 58],\n",
+       " 62: [69],\n",
+       " 28: [60, 46, 34],\n",
+       " 9: [67, 11, 37],\n",
+       " 18: [27],\n",
+       " 46: [48, 73, 79, 61],\n",
+       " 27: [38],\n",
+       " 20: [31, 48, 52, 70, 57, 77],\n",
+       " 53: [69],\n",
+       " 13: [55, 58, 34],\n",
+       " 97: [98],\n",
+       " 70: [72],\n",
+       " 14: [66, 67, 92, 30, 76],\n",
+       " 79: [92],\n",
+       " 66: [67, 79],\n",
+       " 90: [95],\n",
+       " 30: [61],\n",
+       " 61: [67, 94, 81],\n",
+       " 87: [94],\n",
+       " 58: [81],\n",
+       " 51: [63, 98],\n",
+       " 35: [81],\n",
+       " 25: [38, 80, 61],\n",
+       " 38: [81],\n",
+       " 69: [76, 79],\n",
+       " 6: [8, 92, 12, 14],\n",
+       " 60: [63, 71, 70],\n",
+       " 55: [65, 90, 95],\n",
+       " 16: [63],\n",
+       " 33: [92],\n",
+       " 52: [72],\n",
+       " 22: [65, 67],\n",
+       " 31: [39, 48, 37],\n",
+       " 8: [72, 14, 66, 32],\n",
+       " 36: [54],\n",
+       " 47: [99, 91],\n",
+       " 59: [94],\n",
+       " 80: [98],\n",
+       " 50: [66, 60],\n",
+       " 57: [78],\n",
+       " 76: [92],\n",
+       " 10: [94],\n",
+       " 34: [95, 71, 90],\n",
+       " 65: [78],\n",
+       " 84: [92],\n",
+       " 71: [73],\n",
+       " 40: [72],\n",
+       " 72: [92],\n",
+       " 74: [99],\n",
+       " 56: [99],\n",
+       " 1: [79],\n",
+       " 78: [92],\n",
+       " 7: [42],\n",
+       " 63: [68],\n",
+       " 44: [55, 68],\n",
+       " 73: [92],\n",
+       " 81: [92, 94],\n",
+       " 0: [11],\n",
+       " 42: [54],\n",
+       " 68: [98],\n",
+       " 93: [99],\n",
+       " 75: [95],\n",
+       " 24: [91],\n",
+       " 77: [86],\n",
+       " 82: [98],\n",
+       " 45: [49],\n",
+       " 23: [54],\n",
+       " 5: [98],\n",
+       " 89: [92],\n",
+       " 41: [61],\n",
+       " 64: [99],\n",
+       " 88: [92],\n",
+       " 3: [92],\n",
+       " 91: [98],\n",
+       " 96: [99],\n",
+       " 26: [92],\n",
+       " 83: [98],\n",
+       " 2: [98],\n",
+       " 98: [99],\n",
+       " 17: [86],\n",
+       " 43: [95],\n",
+       " 15: [54],\n",
+       " 86: [99],\n",
+       " 85: [99],\n",
+       " 92: [94],\n",
+       " 19: [67]}"
+      ]
+     },
+     "execution_count": 148,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "test.edges"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 85,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "y = data[[\"CTXN3\"]].values\n",
+    "X = np.flip(data.values[:, :1], axis=1)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 90,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "CPU times: user 4.29 ms, sys: 256 µs, total: 4.55 ms\n",
+      "Wall time: 1.46 ms\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/home/cig/anaconda3/lib/python3.6/site-packages/ipykernel_launcher.py:1: FutureWarning: `rcond` parameter will change to the default of machine precision times ``max(M, N)`` where M and N are the input matrix dimensions.\n",
+      "To use the future default and silence this warning we advise to pass `rcond=None`, to keep using the old, explicitly pass `rcond=-1`.\n",
+      "  \"\"\"Entry point for launching an IPython kernel.\n"
+     ]
+    }
+   ],
+   "source": [
+    "%%time\n",
+    "residuals = np.linalg.lstsq(np.c_[X, np.ones_like(X)], y)[1]\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 92,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "CPU times: user 4.43 ms, sys: 25 µs, total: 4.45 ms\n",
+      "Wall time: 1.67 ms\n"
+     ]
+    }
+   ],
+   "source": [
+    "%%time\n",
+    "regression = LinearRegression().fit(X, y)\n",
+    "y_predicted = regression.predict(X)\n",
+    "residuals = y - y_predicted\n",
+    "n, k = X.shape\n",
+    "mean_sq_error = np.sum(np.square(residuals))/n\n",
+    "BIC_score = -n*np.log(mean_sq_error) - 60*k*np.log(n)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 84,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "(2, 537, 10)\n"
+     ]
+    },
+    {
+     "ename": "LinAlgError",
+     "evalue": "Incompatible dimensions",
+     "output_type": "error",
+     "traceback": [
+      "\u001b[0;31m---------------------------------------------------------------------------\u001b[0m",
+      "\u001b[0;31mLinAlgError\u001b[0m                               Traceback (most recent call last)",
+      "\u001b[0;32m<ipython-input-84-248f0fffe49a>\u001b[0m in \u001b[0;36m<module>\u001b[0;34m()\u001b[0m\n\u001b[0;32m----> 1\u001b[0;31m \u001b[0mnp\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mvectorize\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;32mlambda\u001b[0m \u001b[0mx\u001b[0m\u001b[0;34m:\u001b[0m \u001b[0;34m(\u001b[0m\u001b[0mprint\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mx\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mshape\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mnp\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mlinalg\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mlstsq\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mx\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mreshape\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m-\u001b[0m\u001b[0;36m1\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;36m1\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0my\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0msignature\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0;34m'(a,b,c)->(c)'\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0ma\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m",
+      "\u001b[0;32m~/anaconda3/lib/python3.6/site-packages/numpy/lib/function_base.py\u001b[0m in \u001b[0;36m__call__\u001b[0;34m(self, *args, **kwargs)\u001b[0m\n\u001b[1;32m   2753\u001b[0m             \u001b[0mvargs\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mextend\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m[\u001b[0m\u001b[0mkwargs\u001b[0m\u001b[0;34m[\u001b[0m\u001b[0m_n\u001b[0m\u001b[0;34m]\u001b[0m \u001b[0;32mfor\u001b[0m \u001b[0m_n\u001b[0m \u001b[0;32min\u001b[0m \u001b[0mnames\u001b[0m\u001b[0;34m]\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m   2754\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m-> 2755\u001b[0;31m         \u001b[0;32mreturn\u001b[0m \u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0m_vectorize_call\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mfunc\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mfunc\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0margs\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mvargs\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m   2756\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m   2757\u001b[0m     \u001b[0;32mdef\u001b[0m \u001b[0m_get_ufunc_and_otypes\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mself\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mfunc\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0margs\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/lib/python3.6/site-packages/numpy/lib/function_base.py\u001b[0m in \u001b[0;36m_vectorize_call\u001b[0;34m(self, func, args)\u001b[0m\n\u001b[1;32m   2819\u001b[0m         \u001b[0;34m\"\"\"Vectorized call to `func` over positional `args`.\"\"\"\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m   2820\u001b[0m         \u001b[0;32mif\u001b[0m \u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0msignature\u001b[0m \u001b[0;32mis\u001b[0m \u001b[0;32mnot\u001b[0m \u001b[0;32mNone\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m-> 2821\u001b[0;31m             \u001b[0mres\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0m_vectorize_call_with_signature\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mfunc\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0margs\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m   2822\u001b[0m         \u001b[0;32melif\u001b[0m \u001b[0;32mnot\u001b[0m \u001b[0margs\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m   2823\u001b[0m             \u001b[0mres\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mfunc\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/lib/python3.6/site-packages/numpy/lib/function_base.py\u001b[0m in \u001b[0;36m_vectorize_call_with_signature\u001b[0;34m(self, func, args)\u001b[0m\n\u001b[1;32m   2860\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m   2861\u001b[0m         \u001b[0;32mfor\u001b[0m \u001b[0mindex\u001b[0m \u001b[0;32min\u001b[0m \u001b[0mnp\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mndindex\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m*\u001b[0m\u001b[0mbroadcast_shape\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m-> 2862\u001b[0;31m             \u001b[0mresults\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mfunc\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m*\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0marg\u001b[0m\u001b[0;34m[\u001b[0m\u001b[0mindex\u001b[0m\u001b[0;34m]\u001b[0m \u001b[0;32mfor\u001b[0m \u001b[0marg\u001b[0m \u001b[0;32min\u001b[0m \u001b[0margs\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m   2863\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m   2864\u001b[0m             \u001b[0mn_results\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mlen\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mresults\u001b[0m\u001b[0;34m)\u001b[0m \u001b[0;32mif\u001b[0m \u001b[0misinstance\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mresults\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mtuple\u001b[0m\u001b[0;34m)\u001b[0m \u001b[0;32melse\u001b[0m \u001b[0;36m1\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m<ipython-input-84-248f0fffe49a>\u001b[0m in \u001b[0;36m<lambda>\u001b[0;34m(x)\u001b[0m\n\u001b[0;32m----> 1\u001b[0;31m \u001b[0mnp\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mvectorize\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;32mlambda\u001b[0m \u001b[0mx\u001b[0m\u001b[0;34m:\u001b[0m \u001b[0;34m(\u001b[0m\u001b[0mprint\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mx\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mshape\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mnp\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mlinalg\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mlstsq\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mx\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mreshape\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m-\u001b[0m\u001b[0;36m1\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;36m1\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0my\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0msignature\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0;34m'(a,b,c)->(c)'\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0ma\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m",
+      "\u001b[0;32m~/anaconda3/lib/python3.6/site-packages/numpy/linalg/linalg.py\u001b[0m in \u001b[0;36mlstsq\u001b[0;34m(a, b, rcond)\u001b[0m\n\u001b[1;32m   1982\u001b[0m     \u001b[0mldb\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mmax\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mn\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mm\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m   1983\u001b[0m     \u001b[0;32mif\u001b[0m \u001b[0mm\u001b[0m \u001b[0;34m!=\u001b[0m \u001b[0mb\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mshape\u001b[0m\u001b[0;34m[\u001b[0m\u001b[0;36m0\u001b[0m\u001b[0;34m]\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m-> 1984\u001b[0;31m         \u001b[0;32mraise\u001b[0m \u001b[0mLinAlgError\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m'Incompatible dimensions'\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m   1985\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m   1986\u001b[0m     \u001b[0mt\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mresult_t\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0m_commonType\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0ma\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mb\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;31mLinAlgError\u001b[0m: Incompatible dimensions"
+     ]
+    }
+   ],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.6.5"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
